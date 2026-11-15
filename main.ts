@@ -5,7 +5,10 @@
 // LEG B (range / reversion): when the EMA gap is near zero, fade exhaustion: k consecutive down
 //   closes or a fast RSI dip; sell into the bounce after a few bars.
 // Shared: volatility gate, one position, size scaled by volatility, profit target, trailing and
-//   hard stops, drawdown guard that halves size after a retreat from the equity peak.
+//   hard stops, drawdown guard that halves size after a retreat from the equity peak, a loss floor
+//   (no new entries 3% under the start) and a bad-print filter (no entry on a >200 bps bar).
+// tools/sweep.mjs: on dev the edge is one LEG A breakout (last 6h block); pullback, continuation
+//   and quiet-jump second entries all lowered PnL in simulation, so none is enabled.
 //
 // Dev window (falling ~4%): LEG B only fires on a deep, turned dip; LEG A carries the profit.
 // Deterministic: no clock, no env, no randomness. Indicators run on float64 + - * / only;
@@ -39,6 +42,8 @@ const BASE_WEIGHT_BPS = 6500n;
 const MIN_WEIGHT_BPS = 4000n;
 const MAX_WEIGHT_BPS = 7000n;
 const DD_GUARD_BPS = 200n;
+const LOSS_FLOOR_BPS = 300n; // equity this far under the start: no new entries for the rest of the day
+const SPIKE_BPS = 200; // a single-bar move this large is treated as a bad print: no entry on it
 const MAX_SLIP = 100;
 const COOLDOWN = 30;
 // ensemble / pullback additions
@@ -55,6 +60,7 @@ const P_MAX_HOLD = 60;
 
 // ---- state ----
 let hello: any = null;
+let startEq = 1000000000n; // starting equity in quote units; replaced by hello.capital.quote_units
 let warmup = 0;
 let emaF: number | null = null;
 let emaS: number | null = null;
@@ -194,6 +200,11 @@ function decide(batch: any): any[] {
   }
   if (cooldown > 0 || emaF === null || emaS === null || vol === null) return [];
   if (vol < MIN_VOL_BPS || vol > MAX_VOL_BPS) return [];
+  if (equity * 10000n < startEq * (10000n - LOSS_FLOOR_BPS)) return [];
+  if (prevBar !== null) {
+    const jump = ((c - prevBar) / prevBar) * 10000;
+    if (jump > SPIKE_BPS || jump < -SPIKE_BPS) return [];
+  }
 
   const gapBps = ((emaF - emaS) / c) * 10000;
   let want: 'A' | 'B' | 'P' | null = null;
@@ -235,6 +246,8 @@ rl.on('line', (line) => {
   if (msg.type === 'hello') {
     hello = msg;
     warmup = msg.warmup_bars ?? 0; // hello takes no reply in bars-replay/v1
+    const q = msg.capital?.quote_units; // protocol: capital { quote, quote_scale, quote_units }
+    if (typeof q === 'string' && /^[0-9]+$/.test(q)) startEq = BigInt(q);
   } else if (msg.type === 'batch') {
     let orders: any[] = [];
     // A buy that was rejected leaves no position; leg resets on the next flat batch.
